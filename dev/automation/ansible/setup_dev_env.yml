@@ -1,0 +1,110 @@
+---
+- name: Setup CVAT Development and Testing Environment
+  hosts: localhost
+  connection: local
+  vars:
+    cvat_root: "{{ lookup('env', 'PWD') }}"
+    cvat_host: "localhost"
+    cvat_port: 8093
+    admin_user: "admin"
+    admin_pass: "12qwaszx"
+
+  tasks:
+    - name: Ensure required system packages are installed
+      become: yes
+      apt:
+        name:
+          - python3-venv
+          - python3-pip
+          - curl
+          - jq
+        state: present
+        update_cache: yes
+
+    - name: Create Python Virtual Environment for Backend Tests
+      command:
+        cmd: python3 -m venv {{ cvat_root }}/tests/python/venv
+        creates: "{{ cvat_root }}/tests/python/venv"
+
+    - name: Install Backend Test Requirements
+      pip:
+        requirements: "{{ cvat_root }}/tests/python/requirements.txt"
+        virtualenv: "{{ cvat_root }}/tests/python/venv"
+
+    - name: Install CVAT SDK and CLI from PyPI
+      pip:
+        name: 
+          - cvat-sdk==2.62.0
+          - cvat-cli==2.62.0
+        virtualenv: "{{ cvat_root }}/tests/python/venv"
+
+    - name: Deploy docker-compose.override.yml
+      copy:
+        dest: "{{ cvat_root }}/docker-compose.override.yml"
+        content: |
+          services:
+            traefik:
+              ports:
+                - {{ cvat_port }}:8080
+            cvat_server:
+              environment:
+                CVAT_HOST: {{ cvat_host }}
+              volumes: &share_volume
+                - ./tests/mounted_file_share:/home/django/share:ro
+            cvat_worker_import:
+              volumes: *share_volume
+            cvat_worker_export:
+              volumes: *share_volume
+            cvat_worker_annotation:
+              volumes: *share_volume
+            cvat_worker_utils:
+              volumes: *share_volume
+            cvat_worker_quality_reports:
+              volumes: *share_volume
+            cvat_worker_chunks:
+              volumes: *share_volume
+            cvat_worker_consensus:
+              volumes: *share_volume
+
+    - name: Deploy UI Test Runner Script (Headed)
+      copy:
+        dest: "{{ cvat_root }}/run_ui_tests_headed.sh"
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          # CVAT Sequential UI Test Runner - HEADED MODE
+          LOG_FILE="{{ cvat_root }}/tests/sequential_run.log"
+          echo "Starting Headed UI Test Audit at \$(date)" > $LOG_FILE
+
+          # Ordered Specs
+          PATTERNS=(
+              "cypress/e2e/setup/setup.js"
+              "cypress/e2e/setup/setup_project.js"
+              "cypress/e2e/auth_page.js"
+              "cypress/e2e/features/*.js"
+              "cypress/e2e/actions_tasks/**/*.js"
+              "cypress/e2e/actions_objects/**/*.js"
+              "cypress/e2e/remove_users_tasks_projects_organizations.js"
+          )
+
+          cd {{ cvat_root }}/tests
+          for pattern in "${PATTERNS[@]}"; do
+              FILES=\$(find . -path "./\$pattern" -type f | sort)
+              for spec in \$FILES; do
+                  spec_clean=\${spec#./}
+                  echo "Running: \$spec_clean" | tee -a \$LOG_FILE
+                  
+                  # Self-healing admin user
+                  docker exec -it cvat_server python3 manage.py shell -c "from django.contrib.auth.models import User; User.objects.filter(username='{{ admin_user }}').exists() or User.objects.create_superuser('{{ admin_user }}', 'admin@localhost.local', '{{ admin_pass }}')" >> \$LOG_FILE 2>&1
+                  
+                  # Run headed
+                  npx --yes corepack yarn@4.9.2 run cypress run \
+                      --browser electron --headed --spec "\$spec_clean" \
+                      --config baseUrl="http://{{ cvat_host }}:{{ cvat_port }}",defaultCommandTimeout=30000 \
+                      --env user="{{ admin_user }}",password="{{ admin_pass }}" >> \$LOG_FILE 2>&1
+              done
+          done
+
+    - name: Final Reminder
+      debug:
+        msg: "Environment configured. Run 'docker compose up -d' then './run_ui_tests_headed.sh' to start tests."
